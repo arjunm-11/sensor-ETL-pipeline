@@ -1,0 +1,97 @@
+# `docker compose up` starts Postgres and Airflow, and the DAG runs once
+# automatically (it is unpaused at creation; see dags/wsn_pipeline.py).
+# Airflow UI: http://localhost:8080 (admin / admin, local development only).
+
+# Settings shared by every Airflow container (YAML anchor, merged with <<:).
+x-airflow-common: &airflow-common
+  build: .
+  image: wsn-airflow:2.10.5
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor        # one machine, tasks run as subprocesses
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://wsn:wsn@postgres:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # New DAGs start unpaused, so the first run happens on `docker compose up`.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    # Shared by webserver and scheduler so the UI can fetch task logs. Dev value.
+    AIRFLOW__WEBSERVER__SECRET_KEY: wsn-local-dev-secret
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+    # Connection + paths for the pipeline package (pipeline/db.py, __main__.py, report.py).
+    PGHOST: postgres
+    PGPORT: "5432"
+    PGUSER: wsn
+    PGPASSWORD: wsn
+    PGDATABASE: wsn
+    PYTHONPATH: /opt/wsn
+    WSN_DATA_DIR: /opt/wsn/data/raw
+    WSN_REPORT_DIR: /opt/wsn/reports
+  volumes:
+    - ./dags:/opt/airflow/dags:ro
+    - ./pipeline:/opt/wsn/pipeline:ro
+    - ./sql:/opt/wsn/sql:ro
+    - ./tests:/opt/wsn/tests:ro
+    - ./data/raw:/opt/wsn/data/raw:ro              # source files are never modified
+    - ./reports:/opt/wsn/reports                   # quality reports are written here
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16.4
+    container_name: wsn_postgres
+    environment:
+      # Local-dev credentials only; this database is never exposed beyond localhost.
+      POSTGRES_USER: wsn
+      POSTGRES_PASSWORD: wsn
+      POSTGRES_DB: wsn
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Scripts in this folder run once, in filename order, on first startup
+      # (only when the pgdata volume is empty).
+      - ./sql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wsn -d wsn"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: create/upgrade Airflow's metadata tables and the UI user, then exit.
+  airflow-init:
+    <<: *airflow-common
+    container_name: wsn_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate && {
+          airflow users create --username admin --password admin --firstname Local \
+            --lastname Admin --role Admin --email admin@example.com || true; }
+    # The braces scope `|| true` to user creation only (on a second `up` the user
+    # already exists, which is fine); a failed `db migrate` still fails the init.
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: wsn_airflow_scheduler
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: wsn_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
+  airflow-logs:
